@@ -15,6 +15,17 @@ class RedisSentinel:
     def __init__(self, pool):
         # What I need in here -- special Pool controlling Sentinels
         self._pool = pool
+        #
+        # Add dict of pools:
+        #   master -> pool;
+        #
+        # Need a way to know when any connection gets closed
+        # to be able to reconnect and rediscover redis nodes.
+        #
+        # 'connection closed' message must be propagated to
+        # Sentinel manager and nodes discovery must be started again;
+        #
+        # two ways: either use pool subclass or add signals.
 
     def close(self):
         """Close client connections."""
