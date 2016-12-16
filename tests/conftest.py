@@ -205,8 +205,15 @@ def config_writer(path):
 REDIS_SERVERS = []
 
 
-@pytest.yield_fixture(scope='session', params=REDIS_SERVERS)
-def start_server(_proc, request, unused_port):
+@pytest.fixture(scope='session', params=REDIS_SERVERS)
+def server_bin(request):
+    """Common for start_server and start_sentinel server bin path parameter.
+    """
+    return request.param
+
+
+@pytest.fixture(scope='session')
+def start_server(_proc, request, unused_port, server_bin):
     """Starts Redis server instance.
 
     Caches instances by name.
@@ -216,7 +223,7 @@ def start_server(_proc, request, unused_port):
          for backward compatibility).
     """
 
-    version = _read_server_version(request.param)
+    version = _read_server_version(server_bin)
     verbose = request.config.getoption('-v') > 3
 
     servers = {}
@@ -239,6 +246,7 @@ def start_server(_proc, request, unused_port):
             with config_writer(config) as write:
                 write('daemonize no')
                 write('save ""')
+                write('dbfilename ""')
                 write('port', port)
                 write('unixsocket', unixsocket)
                 write('# extra config')
@@ -249,16 +257,17 @@ def start_server(_proc, request, unused_port):
         else:
             args = ['--daemonize', 'no',
                     '--save', '""',
+                    '--dbfilename', '""',
                     '--port', str(port),
                     '--unixsocket', unixsocket,
                     ]
             tmp_files = []
 
-        proc = _proc(request.param,
+        proc = _proc(server_bin,
                      *args,
                      stdout=subprocess.PIPE,
                      _clear_tmp_files=tmp_files)
-        for _ in timeout(3):
+        for _ in timeout(10):
             log = proc.stdout.readline()
             if log and verbose:
                 print(log)
@@ -273,9 +282,9 @@ def start_server(_proc, request, unused_port):
 
 
 @pytest.fixture(scope='session')
-def start_sentinel(_proc, request, unused_port, start_server):
+def start_sentinel(_proc, request, unused_port, server_bin):
     """Starts Redis Sentinel instances."""
-    version = _read_server_version(request.config)
+    version = _read_server_version(server_bin)
     verbose = request.config.getoption('-v') > 3
 
     sentinels = {}
@@ -304,12 +313,12 @@ def start_sentinel(_proc, request, unused_port, start_server):
                 write('sentinel monitor', master.name,
                       '127.0.0.1', master.tcp_address.port, '2')
 
-        proc = _proc(request.config.getoption('--redis-server'),
+        proc = _proc(server_bin,
                      config,
                      '--sentinel',
                      stdout=subprocess.PIPE,
                      _clear_tmp_files=[config])
-        for _ in timeout(3):
+        for _ in timeout(10):
             log = proc.stdout.readline()
             if log and verbose:
                 print(log)
@@ -430,7 +439,11 @@ def pytest_collection_modifyitems(session, config, items):
     for item in items:
         if 'redis_version' in item.keywords:
             marker = item.keywords['redis_version']
-            version = versions[item.callspec.getparam('start_server')]
+            try:
+                version = versions[item.callspec.getparam('server_bin')]
+            except (KeyError, ValueError, AttributeError):
+                # TODO: throw noisy warning
+                continue
             if version < marker.kwargs['version']:
                 item.add_marker(pytest.mark.skip(
                     reason=marker.kwargs['reason']))
