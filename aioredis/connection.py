@@ -138,6 +138,8 @@ class RedisConnection:
                 #       before response
                 logger.error("Exception on data read %r", exc, exc_info=True)
                 break
+            if data == b'' and self._reader.at_eof():
+                logger.debug("Connection has been closed by server")
             self._parser.feed(data)
             while True:
                 try:

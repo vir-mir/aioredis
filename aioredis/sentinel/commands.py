@@ -1,6 +1,8 @@
 import asyncio
 
 from ..util import wait_ok
+from ..commands import Redis
+from .pool import create_sentinel_pool
 from .parser import (
     parse_sentinel_masters,
     parse_sentinel_get_master,
@@ -9,8 +11,22 @@ from .parser import (
     )
 
 
+@asyncio.coroutine
+def create_sentinel(sentinels, *, loop=None):
+    """Creates Redis Sentinel client.
+
+    `sentinels` is a list of sentinel nodes.
+    """
+
+    if loop is None:
+        loop = asyncio.get_event_loop()
+
+    pool = yield from create_sentinel_pool(sentinels, loop=loop)
+    return RedisSentinel(pool)
+
+
 class RedisSentinel:
-    """Redis sentinel client."""
+    """Redis Sentinel client."""
 
     def __init__(self, pool):
         # What I need in here -- special Pool controlling Sentinels
@@ -43,16 +59,19 @@ class RedisSentinel:
 
     def get_master(self, name):
         """Returns Redis client to master Redis server."""
+        return Redis(self._pool.get_master(name))
 
     def get_slave(self, name):
         """Returns Redis client to slave Redis server."""
+        return Redis(self._pool.get_slave(name))
 
     def execute(self, command, *args, **kwargs):
-        return self._pool.execute(b'SENTINEL', command, *args, **kwargs)
+        return self._pool.execute(
+            b'SENTINEL', command, *args, **kwargs)
 
     def ping(self):
+        """Send PING command to Sentinel instance(s)."""  # instances?
         return (yield from self._pool.execute(b'PING'))
-        # return (yield from self.execute(b'PING'))
 
     def master(self, name):
         """Returns a dictionary containing the specified masters state."""
@@ -92,6 +111,7 @@ class RedisSentinel:
 
     def set(self, name, option, value):
         """Set Sentinel monitoring parameters for a given master"""
+        return self.execute(b"SET", name, option, value)
 
     def failover(self, name):
         """Force a failover of a named master."""
@@ -102,5 +122,4 @@ class RedisSentinel:
         to reach the quorum needed to failover a master,
         and the majority needed to authorize the failover.
         """
-        fut = self.execute(b'CKQUORUM', name)
-        return fut
+        return self.execute(b'CKQUORUM', name)

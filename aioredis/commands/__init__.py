@@ -69,6 +69,11 @@ class Redis(GenericCommandsMixin, StringCommandsMixin,
         return self._pool_or_conn
 
     @property
+    def address(self):
+        """Redis connection address (if applicable)."""
+        return self._pool_or_conn.address
+
+    @property
     def in_transaction(self):
         """Set to True when MULTI command was issued."""
         # XXX: this must be bound to real connection

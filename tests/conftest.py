@@ -13,7 +13,7 @@ import logging
 from collections import namedtuple
 
 import aioredis
-import aioredis.sentinel2
+import aioredis.sentinel
 
 
 TCPAddress = namedtuple('TCPAddress', 'host port')
@@ -32,16 +32,17 @@ def loop():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(None)
 
-    yield loop
-
-    if hasattr(loop, 'is_closed'):
-        closed = loop.is_closed()
-    else:
-        closed = loop._closed   # XXX
-    if not closed:
-        loop.call_soon(loop.stop)
-        loop.run_forever()
-        loop.close()
+    try:
+        yield loop
+    finally:
+        if hasattr(loop, 'is_closed'):
+            closed = loop.is_closed()
+        else:
+            closed = loop._closed   # XXX
+        if not closed:
+            loop.call_soon(loop.stop)
+            loop.run_forever()
+            loop.close()
 
 
 @pytest.fixture(scope='session')
@@ -97,14 +98,15 @@ def create_pool(_closable, loop):
 
 
 @pytest.fixture
-def create_sentinel(create_pool, loop):
+def create_sentinel(_closable, create_pool, loop):
     """Helper instantiating RedisSentinel client."""
 
     @asyncio.coroutine
     def f(*args, **kw):
         kw.setdefault('loop', loop)
-        pool = yield from create_pool(*args, **kw)
-        return aioredis.sentinel2.RedisSentinel(pool)
+        client = yield from aioredis.sentinel.create_sentinel(*args, **kw)
+        _closable(client)
+        return client
     return f
 
 
@@ -129,15 +131,16 @@ def redis(create_redis, server, loop):
 def _closable(loop):
     conns = []
 
-    yield conns.append
-
-    waiters = []
-    while conns:
-        conn = conns.pop(0)
-        conn.close()
-        waiters.append(conn.wait_closed())
-    if waiters:
-        loop.run_until_complete(asyncio.gather(*waiters, loop=loop))
+    try:
+        yield conns.append
+    finally:
+        waiters = []
+        while conns:
+            conn = conns.pop(0)
+            conn.close()
+            waiters.append(conn.wait_closed())
+        if waiters:
+            loop.run_until_complete(asyncio.gather(*waiters, loop=loop))
 
 
 @pytest.fixture(scope='session')
@@ -155,14 +158,8 @@ def serverB(start_server):
 @pytest.fixture(scope='session')
 def sentinel(start_sentinel, request, start_server):
     """Starts redis-sentinel instance with one master -- masterA."""
-    masterA = start_server('masterA', [
-        'slave-read-only yes',
-        ])
-    start_server('slaveA', [
-        'slaveof 127.0.0.1 {}'.format(masterA.tcp_address.port),
-        'slave-read-only yes',
-        ])
-    time.sleep(3)
+    masterA = start_server('masterA')
+    start_server('slaveA', slaveof=masterA)
     return start_sentinel('main', masterA)
 
 
@@ -234,46 +231,65 @@ def start_server(_proc, request, unused_port, server_bin):
             yield True
         raise RuntimeError("Redis startup timeout expired")
 
-    def maker(name, config_lines=None):
+    def maker(name, config_lines=None, *, slaveof=None):
+        assert slaveof is None or isinstance(slaveof, RedisServer), slaveof
         if name in servers:
             return servers[name]
 
         port = unused_port()
         tcp_address = TCPAddress('localhost', port)
         unixsocket = '/tmp/aioredis.{}.sock'.format(port)
+        dumpfile = 'dump-{}.rdb'.format(port)
+        tmp_files = [unixsocket, '/tmp/{}'.format(dumpfile)]
         if config_lines:
-            config = '/tmp/aioreids.{}.conf'.format(port)
+            config = '/tmp/aioredis.{}.conf'.format(port)
             with config_writer(config) as write:
                 write('daemonize no')
                 write('save ""')
-                write('dbfilename ""')
+                write('dir /tmp')
+                write('dbfilename', dumpfile)
                 write('port', port)
                 write('unixsocket', unixsocket)
                 write('# extra config')
                 for line in config_lines:
                     write(line)
+                if slaveof is not None:
+                    write("slaveof {0.tcp_address.host} {0.tcp_address.port}"
+                          .format(slaveof))
             args = [config]
-            tmp_files = [config]
+            tmp_files.append(config)
         else:
             args = ['--daemonize', 'no',
                     '--save', '""',
-                    '--dbfilename', '""',
+                    '--dir', '/tmp',
+                    '--dbfilename', dumpfile,
                     '--port', str(port),
                     '--unixsocket', unixsocket,
                     ]
-            tmp_files = []
+            if slaveof is not None:
+                args += [
+                    '--slaveof',
+                    str(slaveof.tcp_address.host),
+                    str(slaveof.tcp_address.port),
+                    ]
 
         proc = _proc(server_bin,
                      *args,
                      stdout=subprocess.PIPE,
                      _clear_tmp_files=tmp_files)
         for _ in timeout(10):
-            log = proc.stdout.readline()
+            log = proc.stdout.readline().decode('utf-8').rstrip()
             if log and verbose:
-                print(log)
-            if b'The server is now ready to accept connections ' in log:
+                print(name, ":", log)
+            if 'The server is now ready to accept connections ' in log:
                 break
-
+        if slaveof is not None:
+            for _ in timeout(10):
+                log = proc.stdout.readline().decode('utf-8').rstrip()
+                if log and verbose:
+                    print(name, ":", log)
+                if 'sync: Finished with success' in log:
+                    break
         info = RedisServer(name, tcp_address, unixsocket, version)
         servers.setdefault(name, info)
         return info
@@ -309,20 +325,31 @@ def start_sentinel(_proc, request, unused_port, server_bin):
             write('save ""')
             write('port', port)
             write('unixsocket', unixsocket)
+            write('loglevel debug')
             for master in masters:
                 write('sentinel monitor', master.name,
-                      '127.0.0.1', master.tcp_address.port, '2')
+                      '127.0.0.1', master.tcp_address.port, '1')
+                write('sentinel down-after-milliseconds', master.name, '3000')
+                write('sentinel failover-timeout', master.name, '3000')
 
         proc = _proc(server_bin,
                      config,
                      '--sentinel',
                      stdout=subprocess.PIPE,
-                     _clear_tmp_files=[config])
-        for _ in timeout(10):
-            log = proc.stdout.readline()
+                     _clear_tmp_files=[unixsocket, config])
+        # XXX: wait sentinel see all masters and slaves;
+        all_masters = {m.name for m in masters}
+        all_slaves = {m.name for m in masters}
+        for _ in timeout(30):
+            log = proc.stdout.readline().decode('utf-8').rstrip()
             if log and verbose:
-                print(log)
-            if b'# +monitor master ' in log:
+                print(name, ":", log)
+            for m in masters:
+                if '# +monitor master {}'.format(m.name) in log:
+                    all_masters.discard(m.name)
+                if '* +slave slave' in log and '@ {}'.format(m.name) in log:
+                    all_slaves.discard(m.name)
+            if not all_masters and not all_slaves:
                 break
         else:
             raise RuntimeError("Could not start Sentinel")
@@ -383,14 +410,18 @@ def _proc():
         tmp_files.update(_clear_tmp_files)
         return proc
 
-    yield run
-
-    while processes:
-        proc = processes.pop(0)
-        proc.terminate()
-        proc.wait()
-    for path in tmp_files:
-        os.remove(path)
+    try:
+        yield run
+    finally:
+        while processes:
+            proc = processes.pop(0)
+            proc.terminate()
+            proc.wait()
+        for path in tmp_files:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
 
 @pytest.mark.tryfirst
@@ -411,13 +442,15 @@ def pytest_pyfunc_call(pyfuncitem):
     function call.
     """
     if 'run_loop' in pyfuncitem.keywords:
+        marker = pyfuncitem.keywords['run_loop']
         funcargs = pyfuncitem.funcargs
         loop = funcargs['loop']
         testargs = {arg: funcargs[arg]
                     for arg in pyfuncitem._fixtureinfo.argnames}
         loop.run_until_complete(
             asyncio.wait_for(pyfuncitem.obj(**testargs),
-                             15, loop=loop))
+                             marker.kwargs.get('timeout', 15),
+                             loop=loop))
         return True
 
 
